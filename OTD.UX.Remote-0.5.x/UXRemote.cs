@@ -12,7 +12,10 @@ using OpenTabletDriver.External.Common.RPC;
 using OpenTabletDriver.Plugin;
 using OpenTabletDriver.Plugin.Attributes;
 using OpenTabletDriver.UX;
+#if NET6_0
 using OpenTabletDriver.UX.Controls;
+using OpenTabletDriver.UX.Windows.Plugins;
+#endif
 using OTD.UX.Remote.Lib;
 using OTD.UX.Remote.Lib.Extensions;
 
@@ -27,7 +30,7 @@ public class UXRemote : IUXRemote, ITool
     public static Type? TabletSwitcherTypeInfo { get; set; }
 
     private static CancellationTokenSource _tokenSource = new();
-    private static RpcServer<UXRemote> Host { get; set; } = new("OTD.UX.Remote");
+    private static RpcServer<UXRemote>? Host { get; set; }
     private static UXRemote? Instance => Host?.Instance;
     private static bool HasStarted { get; set; }
 
@@ -54,6 +57,9 @@ public class UXRemote : IUXRemote, ITool
         HasStarted = true;
         TabletSwitcherTypeInfo = typeof(App).Assembly.GetType("OpenTabletDriver.UX.Controls.TabletSwitcherPanel+TabletSwitcher");
 
+        Host = new RpcServer<UXRemote>("OTD.UX.Remote");
+        Host.ConnectionStateChanged += OnConnectionStateChanged;
+
         Application.Instance.Terminating += OnTerminating;
 
 #if NET5_0
@@ -72,21 +78,28 @@ public class UXRemote : IUXRemote, ITool
         if (settings == null)
             return;
 
-        switch (IsEnabled(), Host)
+        switch (IsEnabled(), Host?.HasStarted)
         {
-            case (true, null):
-                Host = new RpcServer<UXRemote>("OTD.UX.Remote");
-                Host.ConnectionStateChanged += OnConnectionStateChanged;
-                _ = Task.Run(Host.MainAsync, _tokenSource.Token);
-                ShowNotification(null, "RPC Server started.");
-                break;
-            case (true, _):
-                _ = Task.Run(Host.MainAsync, _tokenSource.Token);
+            case (true, false):
+                StartHost(_tokenSource);
                 break;
             case (false, _):
-                Host.Dispose();
+                CancelAndDisposeTokenSource();
+                Host?.Dispose();
                 break;
         }
+    }
+
+    private static void StartHost(CancellationTokenSource cts)
+    {
+        if (Host == null || cts.IsCancellationRequested)
+            return;
+
+        try
+        {
+            _ = Task.Run(Host.MainAsync, cts.Token);
+        }
+        catch (TaskCanceledException) { }
     }
 
 #if NET6_0
@@ -123,17 +136,7 @@ public class UXRemote : IUXRemote, ITool
         Application.Instance.AsyncInvoke(() => SetSettings(settings));
 
 #if NET6_0
-        // Above isn't enough in 0.6.x, as for some reasons, it doesn't update the OutputMode Page
-        if (Application.Instance.MainForm is not MainForm mainForm || TabletSwitcherTypeInfo == null)
-            return;
-
-        // Hope mainForm.Content is TabletSwitcherPanel
-        if (mainForm.Content is not TabletSwitcherPanel tabletSwitcherPanel)
-            return;
-
-        var instance = typeof(TabletSwitcherPanel).GetValue<object>(tabletSwitcherPanel, "tabletSwitcher");
-
-        Application.Instance.AsyncInvoke(() => SetProfiles(instance, settings));
+        App.Current.AllPropertiesChanged();
 #endif
     }
 
@@ -198,8 +201,13 @@ public class UXRemote : IUXRemote, ITool
     }
 #endif
 
-    public static void OnTerminating(object? sender, EventArgs e)
+    public static void OnTerminating(object? sender, EventArgs e) => CancelAndDisposeTokenSource();
+
+    public static void CancelAndDisposeTokenSource()
     {
+        if (_tokenSource == null || _tokenSource.IsCancellationRequested)
+            return;
+        
         _tokenSource.Cancel();
         _tokenSource.Dispose();
     }
